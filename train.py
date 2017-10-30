@@ -1,25 +1,44 @@
 #coding=utf-8
-import tensorflow as tf
+#! /usr/bin/env python
+
+import datetime
+import os
+import time
 import numpy as np
-from data_helper import read_data_sets,cul_feah_sim,cul_feaa_sim,dataset
+import tensorflow as tf
+from tensorflow.contrib import learn
+
+import data_helper
+from MPCNN_model import TextMPCNN
+
+# Parameters
+# ==================================================
+
 # Data loading params
-tf.flags.DEFINE_float("dev_sample_percentage", .1, "Percentage of the training data to use for validation")
-tf.flags.DEFINE_string("sick_dir", "SICK_data/SICK.txt", "Data source for the positive data.")
+tf.flags.DEFINE_float("train_sample_percentage", .9, "Percentage of the training data to use for validation")
+tf.flags.DEFINE_string("data_file", "SICK_data/SICK.txt", "Data source.")
 
 # Model Hyperparameters
-tf.flags.DEFINE_integer("embedding_dim", 50, "Dimensionality of character embedding (default: 128)")
-tf.flags.DEFINE_string("filter_sizes", "3,4,5", "Comma-separated filter sizes (default: '3,4,5')")
-tf.flags.DEFINE_integer("num_filters", 100, "Number of filters per filter size (default: 128)")
+tf.flags.DEFINE_string("h_ws_sizes", "1,2,36", "holistic comma-separated filter sizes (default: '1,2,36')")
+tf.flags.DEFINE_string("p_ws_sizes", "1,2", "perspective comma-separated filter sizes (default: '1,2')")
+tf.flags.DEFINE_string("h_pool_type", "max,mean,min", "holistic pool type (default: 'max,mean,min')")
+tf.flags.DEFINE_string("p_pool_type", "max,min", "perspective pool type (default: 'max,min')")
+tf.flags.DEFINE_integer("filter_size", 300, "filter sizes (default: 300)")
+tf.flags.DEFINE_integer("num_filters", 128, "Number of filters per filter size (default: 128)")
+tf.flags.DEFINE_integer("seq_length", 36, "sequence length (default: 36)")
+tf.flags.DEFINE_integer("num_classes", 1, "number classes (default: 1)")
 tf.flags.DEFINE_float("dropout_keep_prob", 0.5, "Dropout keep probability (default: 0.5)")
-tf.flags.DEFINE_float("l2_reg_lambda", 0.0, "L2 regularization lambda (default: 0.0)")
-tf.flags.DEFINE_integer("sentence_length", 30, "Sentence length (default: 30)")
+tf.flags.DEFINE_float("l2_reg_lambda", 1, "L2 regularization lambda (default: 0.0)")
 
 # Training parameters
-tf.flags.DEFINE_integer("batch_size", 50, "Batch Size (default: 50)")
+tf.flags.DEFINE_integer("batch_size", 64, "Batch Size (default: 64)")
 tf.flags.DEFINE_integer("num_epochs", 200, "Number of training epochs (default: 200)")
 tf.flags.DEFINE_integer("evaluate_every", 100, "Evaluate model on dev set after this many steps (default: 100)")
 tf.flags.DEFINE_integer("checkpoint_every", 100, "Save model after this many steps (default: 100)")
 tf.flags.DEFINE_integer("num_checkpoints", 5, "Number of checkpoints to store (default: 5)")
+# Misc Parameters
+tf.flags.DEFINE_boolean("allow_soft_placement", True, "Allow device soft device placement")
+tf.flags.DEFINE_boolean("log_device_placement", False, "Log placement of ops on devices")
 
 FLAGS = tf.flags.FLAGS
 FLAGS._parse_flags()
@@ -28,141 +47,139 @@ for attr, value in sorted(FLAGS.__flags.items()):
     print("{}={}".format(attr.upper(), value))
 print("")
 
-# 得到权重,偏置,卷积,池化函数
-def weight_variable(shape):
-    initial = tf.truncated_normal(shape,stddev=0.1)
-    return tf.Variable(initial,name='weights')
 
-def bias_variable(shape):
-    initial = tf.constant(0.1, shape=shape)
-    return tf.Variable(initial,name='biases')
+# Data Preparation
+# ==================================================
 
-def conv2d(x, W):
-    return tf.nn.conv2d(x, W, strides=[1,1,1,1],padding='VALID',name='conv')
+# Load data
+print("Loading data...")
+s1 ,s2, score = data_helper.read_data_sets(FLAGS.data_file)
+score = np.asarray([[s] for s in score])
+sample_num = len(score)
+train_end = int(sample_num * FLAGS.train_sample_percentage)
 
-def max_pool_22(x, widow_size):
-    return tf.nn.max_pool(x, ksize=[1, 30 - widow_size + 1, 1, 1], strides=[1,30 - widow_size + 1,1,1], padding='VALID',name='pool')
-
-def avg_pool_22(x, widow_size):
-    return tf.nn.avg_pool(x, ksize=[1, 30 - widow_size + 1, 1, 1], strides=[1,30 - widow_size + 1,1,1], padding='VALID',name='pool')
-
-def min_pool_22(x, widow_size):
-    return -tf.nn.max_pool(-x, ksize=[1, 30 - widow_size + 1, 1, 1], strides=[1,30 - widow_size + 1,1,1], padding='VALID',name='pool')
-
-# 得到数据
-s1_train ,s2_train ,label_train, s1_test, s2_test, label_test, embedding_w = \
-    read_data_sets('MNIST_data', FLAGS)
-
-x1 = tf.placeholder(tf.int64, shape=[None, 30], name='x1_input')
-x2 = tf.placeholder(tf.int64, shape=[None, 30], name='x2_input')
-y_ = tf.placeholder(tf.float32, shape=[None, 1], name='y_input')
-
-s1_image = tf.nn.embedding_lookup(embedding_w, x1)
-s2_image = tf.nn.embedding_lookup(embedding_w, x2)
-x1_flat = tf.reshape(s1_image, [-1, 30, 50, 1])
-x2_flat = tf.reshape(s1_image, [-1, 30, 50, 1])
-
-# windows_size = 30
-Ws130 = weight_variable([30,50,1,100])
-bs130 = bias_variable([100])
-hs130_x1 = tf.nn.relu(conv2d(x1_flat, Ws130) + bs130)
-hs130_x2 = tf.nn.relu(conv2d(x2_flat, Ws130) + bs130)
-maxpool_s130_x1 = max_pool_22(hs130_x1, 30)
-maxpool_s130_x2 = max_pool_22(hs130_x2, 30)
-avgpool_s130_x1 = avg_pool_22(hs130_x1, 30)
-avgpool_s130_x2 = avg_pool_22(hs130_x2, 30)
-minpool_s130_x1 = min_pool_22(hs130_x1, 30)
-minpool_s130_x2 = min_pool_22(hs130_x2, 30)
+# Split train/test set
+# TODO: This is very crude, should use cross-validation
+s1_train, s1_dev = s1[:train_end], s1[train_end:]
+s2_train, s2_dev = s2[:train_end], s2[train_end:]
+score_train, score_dev = score[:train_end], score[train_end:]
+print("Train/Dev split: {:d}/{:d}".format(len(score_train), len(score_dev)))
 
 
-# sentence 1 , windows_size = 1
-Ws11 = weight_variable([1,50,1,100])
-bs11 = bias_variable([100])
-hs11_x1 = tf.nn.relu(conv2d(x1_flat, Ws11) + bs11)
-hs11_x2 = tf.nn.relu(conv2d(x2_flat, Ws11) + bs11)
-maxpool_s11_x1 = max_pool_22(hs11_x1, 1)
-maxpool_s11_x2 = max_pool_22(hs11_x2, 1)
-avgpool_s11_x1 = avg_pool_22(hs11_x1, 1)
-avgpool_s11_x2 = avg_pool_22(hs11_x2, 1)
-minpool_s11_x1 = min_pool_22(hs11_x1, 1)
-minpool_s11_x2 = min_pool_22(hs11_x2, 1)
+# Training
+# ==================================================
 
+with tf.Graph().as_default():
+    session_conf = tf.ConfigProto(
+      allow_soft_placement=FLAGS.allow_soft_placement,
+      log_device_placement=FLAGS.log_device_placement)
+    sess = tf.Session(config=session_conf)
+    with sess.as_default():
+        cnn = TextMPCNN(
+            sequence_length=FLAGS.seq_length,
+            num_classes=FLAGS.num_classes,
+            filter_size=FLAGS.filter_size,
+            h_pool_type=FLAGS.h_pool_type.split(","),
+            p_pool_type=FLAGS.h_pool_type.split(","),
+            h_ws_sizes=list(map(int, FLAGS.h_ws_sizes.split(","))),
+            p_ws_sizes=list(map(int, FLAGS.p_ws_sizes.split(","))),
+            l2_reg_lambda=FLAGS.l2_reg_lambda)
 
-# sentence 1 , windows_size = 2
-Ws12 = weight_variable([2,50,1,100])
-bs12 = bias_variable([100])
-hs12_x1 = tf.nn.relu(conv2d(x1_flat, Ws12) + bs12)
-hs12_x2 = tf.nn.relu(conv2d(x2_flat, Ws12) + bs12)
-maxpool_s12_x1 = max_pool_22(hs12_x1, 2)
-maxpool_s12_x2 = max_pool_22(hs12_x2, 2)
-avgpool_s12_x1 = avg_pool_22(hs12_x1, 2)
-avgpool_s12_x2 = avg_pool_22(hs12_x2, 2)
-minpool_s12_x1 = min_pool_22(hs12_x1, 2)
-minpool_s12_x2 = min_pool_22(hs12_x2, 2)
+        # Define Training procedure
+        global_step = tf.Variable(0, name="global_step", trainable=False)
+        optimizer = tf.train.AdamOptimizer(1e-3)
+        grads_and_vars = optimizer.compute_gradients(cnn.loss)
+        train_op = optimizer.apply_gradients(grads_and_vars, global_step=global_step)
 
-maxsim_feah = cul_feah_sim(maxpool_s11_x1, maxpool_s11_x2, maxpool_s12_x1, maxpool_s12_x2, maxpool_s130_x1, maxpool_s130_x2)
-avgsim_feah = cul_feah_sim(avgpool_s11_x1, avgpool_s11_x2, avgpool_s12_x1, avgpool_s12_x2, avgpool_s130_x1, avgpool_s130_x2)
-minsim_feah = cul_feah_sim(minpool_s11_x1, minpool_s11_x2, minpool_s12_x1, minpool_s12_x2, minpool_s130_x1, minpool_s130_x2)
+        # Keep track of gradient values and sparsity (optional)
+        grad_summaries = []
+        for g, v in grads_and_vars:
+            if g is not None:
+                grad_hist_summary = tf.summary.histogram("{}/grad/hist".format(v.name), g)
+                sparsity_summary = tf.summary.scalar("{}/grad/sparsity".format(v.name), tf.nn.zero_fraction(g))
+                grad_summaries.append(grad_hist_summary)
+                grad_summaries.append(sparsity_summary)
+        grad_summaries_merged = tf.summary.merge(grad_summaries)
 
-maxsim_feaa = cul_feaa_sim(maxpool_s11_x1, maxpool_s11_x2, maxpool_s12_x1, maxpool_s12_x2, maxpool_s130_x1, maxpool_s130_x2)
-avgsim_feaa = cul_feaa_sim(avgpool_s11_x1, avgpool_s11_x2, avgpool_s12_x1, avgpool_s12_x2, avgpool_s130_x1, avgpool_s130_x2)
-minsim_feaa = cul_feaa_sim(minpool_s11_x1, minpool_s11_x2, minpool_s12_x1, minpool_s12_x2, minpool_s130_x1, minpool_s130_x2)
+        # Output directory for models and summaries
+        timestamp = str(int(time.time()))
+        out_dir = os.path.abspath(os.path.join(os.path.curdir, "runs", timestamp))
+        print("Writing to {}\n".format(out_dir))
 
-fea = tf.concat([maxsim_feah,avgsim_feah,minsim_feah, maxsim_feaa,avgsim_feaa,minsim_feaa],3)
-fea_flat = tf.reshape(fea,[-1,327])
+        # Summaries for loss and pearson
+        loss_summary = tf.summary.scalar("loss", cnn.loss)
+        acc_summary = tf.summary.scalar("pearson", cnn.pearson)
 
+        # Train Summaries
+        train_summary_op = tf.summary.merge([loss_summary, acc_summary, grad_summaries_merged])
+        train_summary_dir = os.path.join(out_dir, "summaries", "train")
+        train_summary_writer = tf.summary.FileWriter(train_summary_dir, sess.graph)
 
-W_fc1 = weight_variable([327, 1024])
-b_fc1 = bias_variable([1024])
-h_fc1 = tf.nn.relu(tf.matmul(fea_flat, W_fc1) + b_fc1)
-keep_prob = tf.placeholder(tf.float32)
-h_fc1_drop = tf.nn.dropout(h_fc1, keep_prob)
+        # Dev summaries
+        dev_summary_op = tf.summary.merge([loss_summary, acc_summary])
+        dev_summary_dir = os.path.join(out_dir, "summaries", "dev")
+        dev_summary_writer = tf.summary.FileWriter(dev_summary_dir, sess.graph)
 
-W_fc2 = weight_variable([1024, 1])
-b_fc2 = bias_variable([1])
-y_conv = tf.matmul(h_fc1_drop, W_fc2) + b_fc2
+        # Checkpoint directory. Tensorflow assumes this directory already exists so we need to create it
+        checkpoint_dir = os.path.abspath(os.path.join(out_dir, "checkpoints"))
+        checkpoint_prefix = os.path.join(checkpoint_dir, "model")
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        saver = tf.train.Saver(tf.global_variables(), max_to_keep=FLAGS.num_checkpoints)
 
-sess = tf.InteractiveSession()
-loss = tf.reduce_sum(tf.square(y_conv - y_))
-train_step = tf.train.AdamOptimizer(1e-4).minimize(loss)
-_, pearson = tf.contrib.metrics.streaming_pearson_correlation(y_conv, y_)
-sess.run(tf.local_variables_initializer())
-sess.run(tf.global_variables_initializer())
+        # Initialize all variables
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
 
-STS_train = dataset(s1=s1_train, s2=s2_train, label=label_train)
-print "初始化完毕，开始训练"
-for i in range(20000):
-    batch_train = STS_train.next_batch(50)
-    # 训练模型
-    train_step.run(feed_dict={x1: batch_train[0], x2:batch_train[1], y_: batch_train[2], keep_prob: 0.5})
-    # 对结果进行记录
-    if i % 100 == 0:
-        train_loss = loss.eval(feed_dict={
-            x1: batch_train[0], x2: batch_train[1], y_: batch_train[2], keep_prob: 1.0})
-        train_pearson = pearson.eval(feed_dict={
-                    x1: batch_train[0], x2: batch_train[1], y_: batch_train[2], keep_prob: 1.0})
-        print "step %d, training pearson %g, loss %g" % (i, train_pearson, train_loss)
+        def train_step(s1, s2, score):
+            """
+            A single training step
+            """
+            feed_dict = {
+              cnn.input_s1: s1,
+              cnn.input_s2: s2,
+              cnn.input_y: score,
+              cnn.dropout_keep_prob: FLAGS.dropout_keep_prob
+            }
+            _, step, summaries, loss, pearson = sess.run(
+                [train_op, global_step, train_summary_op, cnn.loss, cnn.pearson],
+                feed_dict)
+            time_str = datetime.datetime.now().isoformat()
+            print("{}: step {}, loss {:g}, pearson {:g}".format(time_str, step, loss, pearson))
+            train_summary_writer.add_summary(summaries, step)
 
-# STS_test = data_helper.dataset(s1=s1_test, s2=s2_test, label=label_test)
-print "test pearson %g"%pearson.eval(feed_dict={
-    x1: s1_test, x2: s2_test, y_: label_test, keep_prob: 1.0})
-print "test loss %g"%loss.eval(feed_dict={
-    x1: s1_test, x2: s2_test, y_: label_test, keep_prob: 1.0})
+        def dev_step(s1, s2, score, writer=None):
+            """
+            Evaluates model on a dev set
+            """
+            feed_dict = {
+              cnn.input_s1: s1,
+              cnn.input_s2: s2,
+              cnn.input_y: score,
+              cnn.dropout_keep_prob: 1.0
+            }
+            step, summaries, loss, pearson = sess.run(
+                [global_step, dev_summary_op, cnn.loss, cnn.pearson],
+                feed_dict)
+            time_str = datetime.datetime.now().isoformat()
+            print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, pearson))
+            if writer:
+                writer.add_summary(summaries, step)
 
+        # Generate batches
+        STS_train = data_helper.dataset(s1=s1_train, s2=s2_train, label=score_train)
+        # Training loop. For each batch...
 
+        for i in range(40000):
+            batch_train = STS_train.next_batch(FLAGS.batch_size)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            train_step(batch_train[0], batch_train[1], batch_train[2])
+            current_step = tf.train.global_step(sess, global_step)
+            if current_step % FLAGS.evaluate_every == 0:
+                print("\nEvaluation:")
+                dev_step(s1_dev, s2_dev, score_dev, writer=dev_summary_writer)
+                print("")
+            if current_step % FLAGS.checkpoint_every == 0:
+                path = saver.save(sess, checkpoint_prefix, global_step=current_step)
+                print("Saved model checkpoint to {}\n".format(path))
 
