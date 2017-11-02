@@ -1,5 +1,6 @@
 # MP-CNN-Tensorflow-sentence-similarity
 This code belongs to the "[Implementing a MPCNN for Sentence Similarity in Tensorflow](http://blog.csdn.net/irving_zhang/article/details/70036708)" blog post.
+
 [paper](https://pdfs.semanticscholar.org/0f69/24633c56832b91836b69aedfd024681e427c.pdf)
 # Requirements：
  - Python 2.7
